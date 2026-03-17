@@ -65,46 +65,98 @@ let threadIds = [];
 
 async function loginWithSession(sessionId) {
   ig = new IgApiClient();
-  ig.state.generateDevice("bot_device_seed");
+  
+  // Clean up session ID - remove whitespace, quotes
+  let cleanSession = sessionId.trim().replace(/^["']|["']$/g, "");
+  
+  // URL decode if needed
+  if (cleanSession.includes("%")) {
+    try { cleanSession = decodeURIComponent(cleanSession); } catch {}
+  }
 
-  // Parse session cookie
-  const cookieStr = decodeURIComponent(sessionId);
-  const parts = cookieStr.split(":");
+  // Extract user ID from session — format: "userId:hash:num"
+  const parts = cleanSession.split(":");
   const userId = parts[0];
+  
+  if (!userId || !/^\d+$/.test(userId)) {
+    throw new Error("Invalid Session ID format — userId not found. Session ID should look like: 12345678:AbCdEf...:5");
+  }
 
-  // Serialize/deserialize approach for session restore
-  await ig.state.deserializeCookieJar(
-    JSON.stringify({
-      version: "tough-cookie@4.0.0",
-      storeType: "MemoryCookieStore",
-      rejectPublicSuffixes: true,
-      cookies: [
-        {
-          key: "sessionid",
-          value: sessionId,
-          domain: ".instagram.com",
-          path: "/",
-          secure: true,
-          httpOnly: true,
-          hostOnly: false,
-        },
-        {
-          key: "ds_user_id",
-          value: userId,
-          domain: ".instagram.com",
-          path: "/",
-          secure: true,
-          hostOnly: false,
-        },
-      ],
-    })
-  );
+  ig.state.generateDevice(userId);
 
-  // Verify session
-  const user = await ig.account.currentUser();
-  connectedUsername = user.username;
-  addLog("system", `লগইন সফল — @${connectedUsername}`);
-  return user;
+  // Build cookie jar with all required cookies
+  const cookieJar = {
+    version: "tough-cookie@4.1.3",
+    storeType: "MemoryCookieStore",
+    rejectPublicSuffixes: true,
+    cookies: [
+      {
+        key: "sessionid",
+        value: cleanSession,
+        domain: "instagram.com",
+        path: "/",
+        secure: true,
+        httpOnly: true,
+        hostOnly: false,
+        creation: new Date().toISOString(),
+        lastAccessed: new Date().toISOString(),
+      },
+      {
+        key: "ds_user_id",
+        value: userId,
+        domain: "instagram.com",
+        path: "/",
+        secure: true,
+        httpOnly: false,
+        hostOnly: false,
+        creation: new Date().toISOString(),
+        lastAccessed: new Date().toISOString(),
+      },
+      {
+        key: "ig_did",
+        value: require("crypto").randomUUID(),
+        domain: "instagram.com",
+        path: "/",
+        secure: true,
+        httpOnly: false,
+        hostOnly: false,
+        creation: new Date().toISOString(),
+        lastAccessed: new Date().toISOString(),
+      },
+      {
+        key: "mid",
+        value: Buffer.from(Date.now().toString()).toString("base64").substring(0, 26),
+        domain: "instagram.com",
+        path: "/",
+        secure: true,
+        httpOnly: false,
+        hostOnly: false,
+        creation: new Date().toISOString(),
+        lastAccessed: new Date().toISOString(),
+      },
+    ],
+  };
+
+  await ig.state.deserializeCookieJar(JSON.stringify(cookieJar));
+
+  // Set auth state
+  ig.state.cookieUserId = userId;
+  ig.state.cookieUsername = "";
+
+  // Verify session works
+  try {
+    const user = await ig.account.currentUser();
+    connectedUsername = user.username;
+    ig.state.cookieUsername = user.username;
+    addLog("system", `লগইন সফল — @${connectedUsername}`);
+    return user;
+  } catch (err) {
+    ig = null;
+    if (err.message && err.message.includes("login_required")) {
+      throw new Error("Session ID expired বা invalid। নতুন Session ID সংগ্রহ করুন: Instagram > DevTools > Application > Cookies > sessionid");
+    }
+    throw new Error(`Instagram verification failed: ${err.message}`);
+  }
 }
 
 async function startBot() {
