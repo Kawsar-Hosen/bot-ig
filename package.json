@@ -1,0 +1,15 @@
+{
+  "name": "instagram-bot-backend",
+  "version": "1.0.0",
+  "description": "Instagram Group Chat Bot Backend for Render",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "instagram-private-api": "^1.46.1"
+  }
+}
