@@ -309,22 +309,176 @@ app.get('/status', (req, res) => {
   });
 });
 
+// Store for challenge handling
+let pendingChallenge = null;
+
 app.post('/login', async (req, res) => {
   try {
-    const { session, username, password } = req.body;
+    const { session, username, password, verificationCode } = req.body;
     
-    addLog('info', 'Login attempt started');
+    addLog('info', 'Login attempt started', { hasSession: !!session, hasCredentials: !!(username && password), hasCode: !!verificationCode });
     
-    if (session) {
-      // Login with session
+    // Handle verification code for pending challenge
+    if (verificationCode && pendingChallenge) {
       try {
-        const sessionData = JSON.parse(Buffer.from(session, 'base64').toString());
+        await ig.challenge.sendSecurityCode(verificationCode);
+        const auth = await ig.account.currentUser();
+        
+        const serialized = await ig.state.serialize();
+        delete serialized.constants;
+        const sessionString = Buffer.from(JSON.stringify(serialized)).toString('base64');
+        
+        botState.loggedInUser = auth;
+        botState.connected = true;
+        botState.lastError = null;
+        pendingChallenge = null;
+        
+        addLog('success', `Logged in as ${auth.username} after verification`);
+        
+        return res.json({ 
+          success: true, 
+          message: `Logged in as ${auth.username}`,
+          user: { username: auth.username, pk: auth.pk },
+          session: sessionString
+        });
+      } catch (verifyError) {
+        throw new Error('Invalid verification code. Please try again.');
+      }
+    }
+    
+    if (username && password) {
+      // Login with username/password
+      try {
+        // Generate new device for this user
+        ig.state.generateDevice(username);
+        
+        // Set proxy if available (helps with rate limiting)
+        if (process.env.PROXY_URL) {
+          ig.state.proxyUrl = process.env.PROXY_URL;
+        }
+        
+        // Try login
+        try {
+          await ig.simulate.preLoginFlow();
+        } catch (e) {
+          // Ignore pre-login errors
+        }
+        
+        const auth = await ig.account.login(username, password);
+        
+        // Run post-login in background
+        process.nextTick(async () => {
+          try {
+            await ig.simulate.postLoginFlow();
+          } catch (e) {
+            // Ignore post-login errors
+          }
+        });
+        
+        // Save session for future use
+        const serialized = await ig.state.serialize();
+        delete serialized.constants;
+        const sessionString = Buffer.from(JSON.stringify(serialized)).toString('base64');
+        
+        botState.loggedInUser = auth;
+        botState.connected = true;
+        botState.lastError = null;
+        
+        addLog('success', `Logged in as ${auth.username} using credentials`);
+        
+        res.json({ 
+          success: true, 
+          message: `Logged in as ${auth.username}`,
+          user: { username: auth.username, pk: auth.pk },
+          session: sessionString
+        });
+        
+      } catch (loginError) {
+        console.log('Login error type:', loginError.name, loginError.message);
+        
+        // Handle checkpoint/challenge
+        if (loginError.name === 'IgCheckpointError') {
+          try {
+            // Try to auto-resolve challenge
+            await ig.challenge.auto(true);
+            pendingChallenge = ig.challenge;
+            
+            addLog('info', 'Challenge required - verification code sent');
+            
+            return res.json({
+              success: false,
+              challengeRequired: true,
+              message: 'Verification code sent to your email/phone. Please enter the code.',
+              challengeType: 'verification'
+            });
+          } catch (challengeError) {
+            throw new Error('Instagram requires verification. Please open Instagram app, complete verification, then try again.');
+          }
+        } 
+        
+        if (loginError.name === 'IgLoginBadPasswordError') {
+          throw new Error('Incorrect password. Please check and try again.');
+        }
+        
+        if (loginError.name === 'IgLoginInvalidUserError') {
+          throw new Error('Username not found. Please check and try again.');
+        }
+        
+        if (loginError.name === 'IgLoginTwoFactorRequiredError') {
+          pendingChallenge = { twoFactor: true, info: loginError.response?.body?.two_factor_info };
+          
+          return res.json({
+            success: false,
+            challengeRequired: true,
+            message: 'Two-factor authentication required. Please enter the code from your authenticator app.',
+            challengeType: '2fa'
+          });
+        }
+        
+        if (loginError.message?.includes('challenge_required')) {
+          throw new Error('Instagram requires verification. Please open Instagram app, complete any security check, then try again.');
+        }
+        
+        throw new Error(`Login failed: ${loginError.message}`);
+      }
+      
+    } else if (session) {
+      // Login with saved session (base64 encoded state from this bot)
+      try {
+        let sessionData;
+        
+        // Check if it's a URL-encoded Instagram cookie sessionid
+        if (session.includes('%3A') || (session.length < 200 && !session.includes('{'))) {
+          // This is an Instagram web cookie sessionid - not directly compatible
+          throw new Error('Web cookie session IDs are not supported. Please use username/password login to generate a valid session.');
+        }
+        
+        // Try parsing as base64 JSON
+        try {
+          const decoded = Buffer.from(session, 'base64').toString();
+          sessionData = JSON.parse(decoded);
+        } catch {
+          // Try parsing directly as JSON
+          try {
+            sessionData = JSON.parse(session);
+          } catch {
+            throw new Error('Invalid session format. Please login with username/password.');
+          }
+        }
+        
+        // Validate session has required fields
+        if (!sessionData.cookies && !sessionData.deviceString) {
+          throw new Error('Invalid session data structure. Please login with username/password.');
+        }
+        
         await ig.state.deserialize(sessionData);
         
-        // Verify session
+        // Verify session is still valid
         const user = await ig.account.currentUser();
+        
         botState.loggedInUser = user;
         botState.connected = true;
+        botState.lastError = null;
         
         addLog('success', `Logged in as ${user.username} using session`);
         
@@ -333,42 +487,70 @@ app.post('/login', async (req, res) => {
           message: `Logged in as ${user.username}`,
           user: { username: user.username, pk: user.pk }
         });
+        
       } catch (sessionError) {
-        throw new Error('Invalid session. Please get a new session ID.');
+        addLog('error', `Session login failed: ${sessionError.message}`);
+        throw new Error(sessionError.message || 'Session expired or invalid. Please login with username/password.');
       }
-    } else if (username && password) {
-      // Login with credentials
-      ig.state.generateDevice(username);
-      
-      await ig.simulate.preLoginFlow();
-      const auth = await ig.account.login(username, password);
-      
-      // Save session for future use
-      const serialized = await ig.state.serialize();
-      delete serialized.constants;
-      const sessionString = Buffer.from(JSON.stringify(serialized)).toString('base64');
-      
-      botState.loggedInUser = auth;
-      botState.connected = true;
-      
-      addLog('success', `Logged in as ${auth.username}`);
-      
-      res.json({ 
-        success: true, 
-        message: `Logged in as ${auth.username}`,
-        user: { username: auth.username, pk: auth.pk },
-        session: sessionString
-      });
     } else {
-      throw new Error('Please provide session or username/password');
+      throw new Error('Please provide username and password');
     }
     
   } catch (error) {
     addLog('error', `Login failed: ${error.message}`);
     botState.lastError = error.message;
+    botState.connected = false;
     res.status(400).json({ 
       success: false, 
       error: error.message 
+    });
+  }
+});
+
+// Endpoint for 2FA verification
+app.post('/verify-2fa', async (req, res) => {
+  try {
+    const { code, username } = req.body;
+    
+    if (!pendingChallenge?.twoFactor) {
+      throw new Error('No pending 2FA verification');
+    }
+    
+    const { totp_two_factor_on, two_factor_identifier } = pendingChallenge.info || {};
+    
+    let verificationMethod = totp_two_factor_on ? '0' : '1';
+    
+    const auth = await ig.account.twoFactorLogin({
+      username,
+      verificationCode: code,
+      twoFactorIdentifier: two_factor_identifier,
+      verificationMethod,
+      trustThisDevice: '1',
+    });
+    
+    const serialized = await ig.state.serialize();
+    delete serialized.constants;
+    const sessionString = Buffer.from(JSON.stringify(serialized)).toString('base64');
+    
+    botState.loggedInUser = auth;
+    botState.connected = true;
+    botState.lastError = null;
+    pendingChallenge = null;
+    
+    addLog('success', `Logged in as ${auth.username} after 2FA`);
+    
+    res.json({ 
+      success: true, 
+      message: `Logged in as ${auth.username}`,
+      user: { username: auth.username, pk: auth.pk },
+      session: sessionString
+    });
+    
+  } catch (error) {
+    addLog('error', `2FA verification failed: ${error.message}`);
+    res.status(400).json({ 
+      success: false, 
+      error: 'Invalid verification code. Please try again.' 
     });
   }
 });
